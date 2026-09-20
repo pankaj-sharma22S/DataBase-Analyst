@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Plot from "react-plotly.js";
 
 const API = "http://localhost:8000";
@@ -12,6 +12,7 @@ type Analysis = {
   user_query?: string;
   schema_overview?: string;
   answer?: string | null;
+  generated_sql?: string | null;
   validated_sql?: string | null;
   primary_result?: Result | null;
   plotly_figure?: { data?: unknown[]; layout?: Record<string, unknown> } | null;
@@ -21,6 +22,8 @@ type Analysis = {
   final_response?: string | null;
   sql_error?: string | null;
 };
+
+const isGreeting = (value: string) => /^(hi|hello|hey|good morning|good afternoon|good evening)[!. ,]*$/i.test(value.trim());
 
 const defaultSteps = (): WorkflowStep[] => [
   { id: "intent_analyzer", label: "Intent Analysis", status: "pending" },
@@ -44,6 +47,10 @@ function App() {
   const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
   const [schema, setSchema] = useState("");
+  const [databaseReady, setDatabaseReady] = useState<Record<string, boolean>>({});
+  const [showDatabaseDialog, setShowDatabaseDialog] = useState(false);
+  const [databaseUri, setDatabaseUri] = useState("");
+  const [connecting, setConnecting] = useState(false);
   const [messagesByThread, setMessagesByThread] = useState<Record<string, ChatMessage[]>>({});
   const chatMessages = selected ? messagesByThread[selected.thread_id] || [] : [];
 
@@ -52,16 +59,18 @@ function App() {
     if (response.ok) setThreads(await response.json());
   };
 
-  useMemo(() => { void loadThreads(); }, []);
+  useEffect(() => { void loadThreads(); }, []);
 
   const createThread = async () => {
     const response = await fetch(`${API}/api/threads`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     const thread = await response.json() as Thread;
     setThreads((old) => [thread, ...old.filter((item) => item.thread_id !== thread.thread_id)]);
-    selectThread(thread);
+    setDatabaseReady((old) => ({ ...old, [thread.thread_id]: false }));
+    await selectThread(thread, false);
+    setShowDatabaseDialog(true);
   };
 
-  const selectThread = async (thread: Thread) => {
+  const selectThread = async (thread: Thread, knownReady?: boolean) => {
     setSelected(thread);
     setAnalysis(null);
     setSteps(defaultSteps());
@@ -70,7 +79,12 @@ function App() {
       fetch(`${API}/api/schema/${thread.thread_id}`),
       fetch(`${API}/api/threads/${thread.thread_id}/history`),
     ]);
-    if (schemaResponse.ok) setSchema((await schemaResponse.json()).schema_overview || "");
+    if (schemaResponse.ok) {
+      setSchema((await schemaResponse.json()).schema_overview || "");
+      setDatabaseReady((old) => ({ ...old, [thread.thread_id]: knownReady ?? true }));
+    } else {
+      setDatabaseReady((old) => ({ ...old, [thread.thread_id]: false }));
+    }
     if (historyResponse.ok) {
       const records = await historyResponse.json() as Analysis[];
       const restored: ChatMessage[] = [];
@@ -87,22 +101,48 @@ function App() {
   };
 
   const connectDatabase = async () => {
-    if (!selected) return;
-    const databaseUri = window.prompt("Database URI", "mysql+pymysql://root:password@localhost:3306/company");
-    if (!databaseUri) return;
-    const response = await fetch(`${API}/api/database/connect`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ thread_id: selected.thread_id, database_uri: databaseUri }),
-    });
-    if (!response.ok) setError("Connection failed");
+    if (selected) setShowDatabaseDialog(true);
+  };
+
+  const submitDatabaseConnection = async () => {
+    if (!selected || !databaseUri.trim() || connecting) return;
+    setConnecting(true);
+    setError("");
+    try {
+      const response = await fetch(`${API}/api/database/connect`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ thread_id: selected.thread_id, database_uri: databaseUri.trim() }),
+      });
+      if (!response.ok) throw new Error("Connection failed");
+      setDatabaseReady((old) => ({ ...old, [selected.thread_id]: true }));
+      setDatabaseUri("");
+      setShowDatabaseDialog(false);
+      const schemaResponse = await fetch(`${API}/api/schema/${selected.thread_id}`);
+      if (schemaResponse.ok) setSchema((await schemaResponse.json()).schema_overview || "");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Connection failed");
+    } finally {
+      setConnecting(false);
+    }
   };
 
   const runAnalysis = async () => {
     if (!selected || !query.trim() || running) return;
     const submittedQuery = query.trim();
+    if (!databaseReady[selected.thread_id] && !isGreeting(submittedQuery)) {
+      setError("Connect a database to this thread before asking a data question.");
+      setShowDatabaseDialog(true);
+      return;
+    }
     const userMessage: ChatMessage = { id: `${selected.thread_id}-${Date.now()}-user`, role: "user", content: submittedQuery };
     const assistantMessage: ChatMessage = { id: `${selected.thread_id}-${Date.now()}-assistant`, role: "assistant", content: "Working through the analysis…", pending: true, steps: defaultSteps() };
     setMessagesByThread((old) => ({ ...old, [selected.thread_id]: [...(old[selected.thread_id] || []), userMessage, assistantMessage] }));
+    setQuery("");
+    if (isGreeting(submittedQuery)) {
+      const greeting = "Hello! How can I help you analyze your data?";
+      setMessagesByThread((old) => ({ ...old, [selected.thread_id]: (old[selected.thread_id] || []).map((message, index, list) => index === list.length - 1 ? { ...message, content: greeting, pending: false } : message) }));
+      return;
+    }
     setRunning(true); setError(""); setAnalysis(null); setSteps(defaultSteps()); setActiveTab("answer");
     try {
       const response = await fetch(`${API}/api/analyze/${selected.thread_id}/stream?query=${encodeURIComponent(submittedQuery)}`);
@@ -161,10 +201,10 @@ function App() {
     </aside>
     <main className="main-panel">
       {!selected ? <EmptyState onCreate={createThread} onConnect={createThread} /> : <>
-        <header className="analysis-header"><div><div className="eyebrow">THREAD / {selected.thread_id}</div><h1>{selected.name}</h1></div><button className="secondary" onClick={() => void selectThread(selected)}>↻ Refresh</button></header>
-        <section className="query-bar"><input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void runAnalysis(); }} placeholder="Ask a question about your data..." disabled={running} /><button className="primary" onClick={() => void runAnalysis()} disabled={running || !query.trim()}>{running ? "Analyzing…" : "Analyze"} <span>→</span></button></section>
-        {chatMessages.length > 0 && <ChatMessages messages={chatMessages} />}
-        {running || analysis ? <><Workflow steps={steps} /><div className="content-card"><nav className="tabs">{availableTabs.map((tab) => <button className={activeTab === tab.id ? "active" : ""} key={tab.id} onClick={() => setActiveTab(tab.id)}><span>{tab.icon}</span>{tab.label}</button>)}</nav>{activeTab === "answer" && <Answer analysis={analysis} />}{activeTab === "sql" && <Sql sql={analysis?.validated_sql || ""} />}{activeTab === "results" && <Results result={analysis?.primary_result || null} />}{activeTab === "visualization" && <Visualization figure={analysis?.plotly_figure || null} />}{activeTab === "diagnostic" && <Diagnostic report={analysis?.diagnostic_report || null} />}{activeTab === "insights" && <Insights values={analysis?.insights || []} />}</div></> : <div className="schema-card"><div className="eyebrow">SCHEMA EXPLORER</div><h2>Connected database schema</h2><SchemaExplorer overview={schema} /></div>}
+        <header className="analysis-header"><div><div className="eyebrow">THREAD / {selected.thread_id}</div><h1>{selected.name}</h1></div></header>
+        {chatMessages.length > 0 ? <ChatMessages messages={chatMessages} /> : <div className="schema-card"><div className="eyebrow">SCHEMA EXPLORER</div><h2>Connected data source</h2><SchemaExplorer overview={schema} /></div>}
+        {running && <div className="stream-note"><span className="status-dot" />Insight AI is analyzing this thread…</div>}
+        <section className="query-bar composer"><input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void runAnalysis(); }} placeholder="Ask a question about your data..." disabled={running} /><button className="primary" onClick={() => void runAnalysis()} disabled={running || !query.trim()}>{running ? "Analyzing…" : "Send"} <span>→</span></button></section>
         {error && <div className="error-card"><strong>Analysis failed</strong><span>{error}</span><button className="secondary" onClick={() => void runAnalysis()}>Retry</button></div>}
       </>}
     </main>
@@ -173,13 +213,46 @@ function App() {
 
 function EmptyState({ onCreate, onConnect }: { onCreate: () => void; onConnect: () => void }) { return <div className="empty-state"><div className="empty-icon">▱</div><h1>Select or create a thread</h1><p>Threads keep your analyses organized.<br />Each thread has its own database connection and conversation history.</p><div><button className="primary" onClick={onCreate}>New Thread</button><button className="secondary" onClick={onConnect}>Connect Database</button></div></div>; }
 
-function Workflow({ steps }: { steps: WorkflowStep[] }) { return <div className="workflow"><div className="eyebrow">WORKFLOW</div>{steps.map((step) => <div className={`workflow-step ${step.status}`} key={step.id}><span className="step-mark">{step.status === "completed" ? "✓" : step.status === "running" ? "•" : step.status === "failed" ? "!" : ""}</span><div><strong>{step.label}</strong><small>{step.status}</small></div></div>)}</div>; }
+function DatabaseDialog({ value, connecting, required, onChange, onSubmit, onClose }: { value: string; connecting: boolean; required: boolean; onChange: (value: string) => void; onSubmit: () => void; onClose: () => void }) {
+  return <div className="dialog-backdrop" role="presentation"><div className="database-dialog" role="dialog" aria-modal="true" aria-labelledby="database-dialog-title"><div className="content-heading"><div><div className="eyebrow">THREAD DATABASE</div><h2 id="database-dialog-title">Connect this conversation</h2></div>{!required && <button className="dialog-close" onClick={onClose} aria-label="Close">×</button>}</div><p>Enter a database URL for this thread. It is sent only to the existing backend connection endpoint and is cleared from this UI after connection.</p><input autoFocus type="password" value={value} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") onSubmit(); }} placeholder="Database connection URL" autoComplete="off" /><div className="dialog-actions"><button className="secondary" onClick={onClose} disabled={required || connecting}>Cancel</button><button className="primary" onClick={onSubmit} disabled={!value.trim() || connecting}>{connecting ? "Connecting…" : "Connect"}</button></div></div></div>;
+}
+
+function Workflow({ steps }: { steps: WorkflowStep[] }) {
+  const phases = [
+    { id: "analysis", label: "Analysis", source: ["intent_analyzer"] },
+    { id: "schema", label: "Schema", source: ["decomposition_node"] },
+    { id: "sql", label: "SQL Generation", source: ["sql_agent"] },
+    { id: "execution", label: "Execution", source: ["execution_planner"] },
+    { id: "result", label: "Result", source: ["final_composer"] },
+  ];
+  const statusFor = (source: string[]) => {
+    const matching = steps.filter((step) => source.includes(step.id));
+    if (matching.some((step) => step.status === "failed")) return "failed";
+    if (matching.some((step) => step.status === "running")) return "running";
+    if (matching.length && matching.every((step) => step.status === "completed")) return "completed";
+    return "pending";
+  };
+  return <div className="workflow compact-workflow"><div className="eyebrow">PROGRESS</div>{phases.map((phase) => { const status = statusFor(phase.source); return <div className={`workflow-step ${status}`} key={phase.id}><span className="step-mark">{status === "completed" ? "✓" : status === "running" ? "•" : status === "failed" ? "!" : ""}</span><div><strong>{phase.label}</strong><small>{status}</small></div></div>; })}</div>;
+}
 
 function Answer({ analysis }: { analysis: Analysis | null }) { const text = analysis?.answer || analysis?.final_response || "Waiting for the final analysis…"; return <section className="tab-content"><div className="eyebrow">ANSWER</div><h2>Analysis result</h2><MarkdownText text={text} /></section>; }
-function ChatMessages({ messages }: { messages: ChatMessage[] }) { return <section className="chat-panel">{messages.map((message, index) => <div className={`chat-row ${message.role}`} key={message.id || `${message.role}-${index}`}><div className="chat-avatar">{message.role === "user" ? "DA" : "✧"}</div><div className="chat-bubble"><div className="chat-role">{message.role === "user" ? "You" : "Insight AI"}</div><MarkdownText text={message.content} />{message.pending && <span className="typing"><i /> <i /> <i /></span>}{message.role === "assistant" && message.analysis && <MessageArtifacts analysis={message.analysis} steps={message.steps || defaultSteps().map((step) => ({ ...step, status: "completed" }))} />}</div></div>)}</section>; }
-function MessageArtifacts({ analysis, steps }: { analysis: Analysis; steps: WorkflowStep[] }) { return <details className="message-artifacts" open><summary>Structured analysis</summary><Workflow steps={steps} />{analysis.validated_sql && <Sql sql={analysis.validated_sql} />}{analysis.primary_result && <Results result={analysis.primary_result} />}{analysis.plotly_figure && <Visualization figure={analysis.plotly_figure} />}{analysis.insights?.length ? <Insights values={analysis.insights} /> : null}{analysis.diagnostic_report?.diagnosis && <Diagnostic report={analysis.diagnostic_report} />}</details>; }
+function ChatMessages({ messages }: { messages: ChatMessage[] }) { return <section className="chat-panel">{messages.map((message, index) => <div className={`chat-row ${message.role}`} key={message.id || `${message.role}-${index}`}><div className="chat-avatar">{message.role === "user" ? "DA" : "✧"}</div><div className="chat-bubble"><div className="chat-role">{message.role === "user" ? "You" : "Insight AI"}</div>{(message.role === "user" || (!message.analysis && !message.pending)) && <MarkdownText text={message.content} />}{message.pending && <><MarkdownText text={message.content} /><span className="typing"><i /> <i /> <i /></span></>}{message.role === "assistant" && <MessageArtifacts analysis={message.analysis || null} steps={message.steps || defaultSteps()} pending={Boolean(message.pending)} />}</div></div>)}</section>; }
+function MessageArtifacts({ analysis, steps, pending }: { analysis: Analysis | null; steps: WorkflowStep[]; pending: boolean }) {
+  const [active, setActive] = useState("answer");
+  if (!analysis && !pending) return null;
+  const tabs = [
+    { id: "answer", label: "Answer", show: true },
+    { id: "sql", label: "Query", show: Boolean(analysis?.validated_sql || analysis?.generated_sql) },
+    { id: "visualization", label: "Visualization", show: Boolean(analysis?.plotly_figure) },
+    { id: "insights", label: "Insights", show: Boolean(analysis?.insights?.length) },
+    { id: "results", label: "Results", show: Boolean(analysis?.primary_result) },
+    { id: "diagnostic", label: "Diagnostic", show: Boolean(analysis?.diagnostic_report?.diagnosis) },
+  ].filter((tab) => tab.show);
+  const selected = tabs.some((tab) => tab.id === active) ? active : "answer";
+  return <section className="message-artifacts"><Workflow steps={steps} /><div className="response-container"><nav className="tabs response-tabs">{tabs.map((tab) => <button className={selected === tab.id ? "active" : ""} key={tab.id} onClick={() => setActive(tab.id)}>{tab.label}</button>)}</nav>{selected === "answer" && <Answer analysis={analysis} />}{selected === "sql" && <Sql sql={analysis?.validated_sql || analysis?.generated_sql || ""} />}{selected === "visualization" && <Visualization figure={analysis?.plotly_figure || null} />}{selected === "insights" && <Insights values={analysis?.insights || []} />}{selected === "results" && <Results result={analysis?.primary_result || null} />}{selected === "diagnostic" && <Diagnostic report={analysis?.diagnostic_report || null} />}{pending && <div className="response-loading">Waiting for structured results…</div>}</div></section>;
+}
 function SchemaExplorer({ overview }: { overview: string }) { const tables = overview.split("\n").map((line) => { const match = line.match(/^Table `?([^`]+)`?:\s*(.*)$/); if (!match) return null; return { name: match[1], columns: match[2].split(/,\s*/).map((column) => column.replace(/\s*\([^)]*\)$/, "")) }; }).filter(Boolean) as { name: string; columns: string[] }[]; if (!tables.length) return <pre>{overview || "Schema will appear after a database connection."}</pre>; return <div className="schema-tree">{tables.map((table) => <div className="schema-table" key={table.name}><strong>▾ {table.name}</strong>{table.columns.map((column) => <span key={column}>├── {column}</span>)}</div>)}</div>; }
-function MarkdownText({ text }: { text: string }) { return <div className="markdown">{text.split("\n").map((line, index) => line.startsWith("-") || line.startsWith("•") ? <div className="bullet" key={index}>• {line.replace(/^[-•]\s*/, "")}</div> : line.startsWith("#") ? <h3 key={index}>{line.replace(/^#+\s*/, "")}</h3> : <p key={index}>{line || "\u00a0"}</p>)}</div>; }
+function MarkdownText({ text }: { text: string }) { return <div className="markdown plain-text">{text}</div>; }
 function Sql({ sql }: { sql: string }) { return <section className="tab-content"><div className="content-heading"><div><div className="eyebrow">SQL QUERY</div><h2>Executed SQL</h2></div><button className="secondary" onClick={() => void navigator.clipboard.writeText(sql)}>Copy</button></div><pre className="sql-block"><code>{sql}</code></pre></section>; }
 
 function Results({ result }: { result: Result | null }) { const [search, setSearch] = useState(""); const [page, setPage] = useState(0); const pageSize = 10; const rows = (result?.rows || []).filter((row) => JSON.stringify(row).toLowerCase().includes(search.toLowerCase())); const visible = rows.slice(page * pageSize, (page + 1) * pageSize); const download = () => { if (!result) return; const csv = [result.columns, ...result.rows.map((row) => result.columns.map((column) => JSON.stringify(row[column] ?? "")))].map((row) => row.join(",")).join("\n"); const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); const anchor = document.createElement("a"); anchor.href = url; anchor.download = "insight-results.csv"; anchor.click(); URL.revokeObjectURL(url); }; return <section className="tab-content"><div className="content-heading"><div><div className="eyebrow">RESULTS</div><h2>{result?.row_count || 0} rows returned</h2></div><div><input className="small-input" placeholder="Search results" value={search} onChange={(event) => { setSearch(event.target.value); setPage(0); }} /><button className="secondary" onClick={download}>CSV</button></div></div><div className="table-wrap"><table><thead><tr>{(result?.columns || []).map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{visible.map((row, index) => <tr key={index}>{(result?.columns || []).map((column) => <td key={column}>{row[column] == null ? <span className="null">NULL</span> : String(row[column])}</td>)}</tr>)}</tbody></table></div><div className="pagination"><span>Showing {rows.length ? page * pageSize + 1 : 0}–{Math.min((page + 1) * pageSize, rows.length)} of {rows.length}</span><button className="secondary" disabled={page === 0} onClick={() => setPage(page - 1)}>‹</button><button className="secondary" disabled={(page + 1) * pageSize >= rows.length} onClick={() => setPage(page + 1)}>›</button></div></section>; }

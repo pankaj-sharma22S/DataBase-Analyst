@@ -7,6 +7,7 @@ from langgraph.graph import END, START, StateGraph
 
 from memory.conversation_memory import ConversationMemory
 from memory.long_term_memory import LongTermMemory
+from memory.memory_manager import MemoryManager
 from memory.working_memory import WorkingMemory
 
 
@@ -49,6 +50,21 @@ class MemoryTests(unittest.TestCase):
                 self.assertEqual(memory.retrieve("one", "password"), [])
             finally:
                 memory.close()
+
+    def test_long_term_and_preference_memory_are_thread_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = MemoryManager(Path(directory))
+            try:
+                manager.remember("thread_a", "I prefer compact tables", "Stored for thread A")
+
+                thread_a = manager.retrieve_context("thread_a", "compact tables")
+                thread_b = manager.retrieve_context("thread_b", "compact tables")
+
+                self.assertIn("compact tables", thread_a)
+                self.assertNotIn("compact tables", thread_b)
+                self.assertIn("Relevant preferences for this thread", thread_a)
+            finally:
+                manager.close()
 
 
 if __name__ == "__main__":

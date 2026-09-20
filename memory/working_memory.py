@@ -5,13 +5,22 @@ import sqlite3
 
 
 class WorkingMemory:
-    def __init__(self, database_path: str | Path = "memory/working_memory.sqlite3"):
+    def __init__(self, database_path: str | Path = "memory/working_memory.sqlite3", database_url: str | None = None):
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.persistent = False
         self._connection = None
 
         try:
+            if database_url and database_url.startswith("postgres"):
+                from langgraph.checkpoint.postgres import PostgresSaver
+                self._postgres_context = PostgresSaver.from_conn_string(
+                    database_url.replace("postgresql+psycopg://", "postgresql://", 1)
+                )
+                self.checkpointer = self._postgres_context.__enter__()
+                self.checkpointer.setup()
+                self.persistent = True
+                return
             from langgraph.checkpoint.sqlite import SqliteSaver
             from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
         except ImportError:
@@ -33,5 +42,8 @@ class WorkingMemory:
         return self.checkpointer
 
     def close(self) -> None:
+        if hasattr(self, "_postgres_context"):
+            self._postgres_context.__exit__(None, None, None)
+            return
         if self._connection is not None:
             self._connection.close()

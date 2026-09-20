@@ -1,0 +1,14 @@
+INFO:     Started server process [18188]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Deserializing unregistered type main3.IntentAnalysis from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly: [('main3', 'IntentAnalysis')]
+Deserializing unregistered type main3.DecompositionPlan from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly: [('main3', 'DecompositionPlan')]
+Deserializing unregistered type main3.ExecutionPlan from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly: [('main3', 'ExecutionPlan')]
+Deserializing unregistered type main3.NormalizedResult from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly: [('main3', 'NormalizedResult')]
+Deserializing unregistered type main3.RelationshipPlan from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly: [('main3', 'RelationshipPlan')]
+E:\last_Chance\main3.py:1179: FutureWarning: errors='ignore' is deprecated and will raise in a future version. Use to_numeric without passing `errors` and catch exceptions explicitly instead
+  df[y] = pd.to_numeric(df[y], errors='ignore')
+Deserializing unregistered type main3.ChartSpecification from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly: [('main3', 'ChartSpecification')]
+Deserializing unregistered type main3.AgentResult from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly: [('main3', 'AgentResult')]
+Deserializing unregistered type main3.DiagnosticReport from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly: [('main3', 'DiagnosticReport')]

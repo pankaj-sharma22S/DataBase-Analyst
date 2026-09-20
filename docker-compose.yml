@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16
-    container_name: text_to_sql_postgres
+    container_name: text_to_sql
     restart: unless-stopped
 
     environment:
@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: pankaj
 
     ports:
-      - "5432:5432"
+      - "15432:5432"
 
     volumes:
       - postgres_data:/var/lib/postgresql/data

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator, Optional
@@ -29,6 +30,21 @@ app.add_middleware(
 )
 workflow = build_workflow()
 threads: dict[str, dict[str, Any]] = {}
+
+
+def _trace_config(thread_id: str, query: str, surface: str) -> dict[str, Any]:
+    """Attach searchable LangSmith metadata without sending secrets or URLs."""
+    return {
+        "configurable": {"thread_id": thread_id},
+        "run_name": f"InsightAI/{surface}/{thread_id}",
+        "tags": ["text-to-sql", "insight-ai", surface],
+        "metadata": {
+            "thread_id": thread_id,
+            "surface": surface,
+            "query_length": len(query),
+            "workflow": "langgraph-sql-analysis",
+        },
+    }
 
 
 class AnalyzeRequest(BaseModel):
@@ -85,13 +101,15 @@ def _state_payload(state: Any) -> dict[str, Any]:
         "thread_id": data.get("thread_id"),
         "user_query": data.get("user_query", ""),
         "schema_overview": data.get("schema_overview", ""),
+        "relationship_plan": data.get("relationship_plan"),
         "intent": data.get("intent"),
         "execution_plan": data.get("execution_plan"),
-        "generated_sql": data.get("generated_sql"),
+        "generated_sql": data.get("validated_sql") or None,
         "validated_sql": data.get("validated_sql"),
         "executed_sqls": data.get("executed_sqls", []),
-        "sql_error": data.get("sql_error"),
+        "sql_error": data.get("sql_error") if data.get("validated_sql") else None,
         "primary_result": data.get("primary_result"),
+        "agent_result": data.get("agent_result"),
         "answer": data.get("answer"),
         "chart_spec": data.get("chart_spec"),
         "plotly_figure": data.get("plotly_figure"),
@@ -104,11 +122,76 @@ def _state_payload(state: Any) -> dict[str, Any]:
     }
 
 
+def _tokens(value: Any) -> set[str]:
+    return set(re.findall(r"\w+", str(value or "").lower()))
+
+
+def _structured_thread_context(thread_id: str, query: str, limit: int = 4) -> str:
+    """Return compact, relevant structured results from this thread only."""
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str | None]] = set()
+    query_tokens = _tokens(query)
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        for snapshot in workflow.get_state_history(config):
+            payload = _state_payload(snapshot.values)
+            previous_query = payload.get("user_query")
+            if not previous_query or not payload.get("final_response"):
+                continue
+            checkpoint_id = snapshot.config.get("configurable", {}).get("checkpoint_id")
+            key = (previous_query, checkpoint_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(payload)
+    except Exception:
+        return ""
+
+    # History is returned newest-first. Relevance is lexical and generic; the
+    # newest turn is retained even for pronoun-based follow-ups with no shared
+    # words, while older unrelated turns naturally rank below it.
+    ranked = []
+    for index, record in enumerate(records):
+        source = " ".join([
+            str(record.get("user_query", "")),
+            str(record.get("answer", "")),
+            str(record.get("final_response", "")),
+            str(record.get("insights", "")),
+        ])
+        overlap = len(query_tokens & _tokens(source))
+        ranked.append((overlap, -index, record))
+    ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    selected = [item[2] for item in ranked[:limit]]
+    if records and records[0] not in selected:
+        if len(selected) >= limit:
+            selected[-1] = records[0]
+        else:
+            selected.append(records[0])
+    if not selected:
+        return ""
+    compact: list[dict[str, Any]] = []
+    for record in reversed(selected):
+        result = record.get("primary_result") or {}
+        compact.append({
+            "user_query": record.get("user_query", ""),
+            "answer": record.get("answer") or record.get("final_response", ""),
+            "validated_sql": record.get("validated_sql"),
+            "result_columns": result.get("columns", []) if isinstance(result, dict) else [],
+            "result_rows": (result.get("rows", []) if isinstance(result, dict) else [])[:20],
+            "insights": record.get("insights", []),
+            "diagnostic": record.get("diagnostic_report"),
+        })
+    return json.dumps(compact, ensure_ascii=False, default=str)
+
+
 def _memory_messages(thread_id: str, query: str) -> list[Any]:
     context = memory_manager.retrieve_context(thread_id, query)
+    structured = _structured_thread_context(thread_id, query)
+    context_parts = [part for part in [context, "Relevant structured results from this thread:\n" + structured if structured else ""] if part]
     messages: list[Any] = []
-    if context:
-        messages.append(SystemMessage(content=context))
+    if context_parts:
+        messages.append(SystemMessage(content="Thread-scoped context. Use it only to resolve the current request's references; the current request remains authoritative.\n\n" + "\n\n".join(context_parts)))
     messages.append(HumanMessage(content=query))
     return messages
 
@@ -203,7 +286,10 @@ def get_chart() -> FileResponse:
 @app.post("/api/analyze")
 def analyze(request: AnalyzeRequest) -> dict[str, Any]:
     try:
-        result = workflow.invoke(_input(request), config={"configurable": {"thread_id": request.thread_id}})
+        result = workflow.invoke(
+            _input(request),
+            config=_trace_config(request.thread_id, request.query, "analyze"),
+        )
         payload = _state_payload(result)
         if not payload.get("security_blocked"):
             memory_manager.remember(request.thread_id, request.query, payload.get("final_response") or "")
@@ -213,7 +299,7 @@ def analyze(request: AnalyzeRequest) -> dict[str, Any]:
 
 
 async def _stream_analysis(request: AnalyzeRequest) -> AsyncIterator[str]:
-    config = {"configurable": {"thread_id": request.thread_id}}
+    config = _trace_config(request.thread_id, request.query, "stream")
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
     active_steps: set[str] = set()
