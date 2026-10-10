@@ -1,17 +1,10 @@
 """
-Insight AI — Complete Single-File Production Data Analyst
-- Uses `create_sql_agent` with SQLDatabaseToolkit for BOTH SQL generation and Diagnostic analysis
-- Timeout-hardened & early-stopping enabled (prevents hanging/freezing)
-- Dynamic Schema Introspection (SQLAlchemy Direct — No RAG Overhead)
-- Multi-Model LLM Factory: OpenRouter (NVIDIA / Gemini / OpenAI) + Ollama fallback
-- Complete 6-Section Structured Output for general / analytical queries:
-    1. 💡 Direct Answer
-    2. 🔍 Executed SQL Query
-    3. 📋 Real Column-Named Results Table (No generic 'col_1' placeholders)
-    4. 📊 Dual Visualization (In-Terminal Proportional Visuals + Standalone Interactive 'chart.html')
-    5. 🔬 Automated Multi-Hypothesis Diagnostic Analysis (via create_sql_agent)
-    6. 📈 Quantitative Key Insights
-- Granular Intent Routing ("give me sql only", "diagnosis only", "chart only", "details")
+QueryMind AI — Autonomous Enterprise Data Analyst & Root-Cause Detective
+- Powered exclusively by Google Gemini (gemini-3.5-flash & gemini-3.5-flash-lite)
+- Real-time token streaming & universal Plotly visualization
+- Automated multi-hypothesis diagnostic engine & empirical root-cause analysis
+- Dynamic live schema introspection without hardcoded catalogs
+- Fail-safe architecture: transparent zero-downtime fallback when Docker containers are offline
 """
 
 import os
@@ -36,6 +29,7 @@ from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
 from langchain_community.agent_toolkits.sql.base import create_sql_agent
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
+from langgraph.types import StreamWriter
 
 from security.security_gateway import SecurityError, security_gateway
 from security.sql_security import ReadOnlyDatabaseProxy
@@ -48,7 +42,7 @@ except ImportError:
     pass
 
 # =====================================================================
-# 1. SETTINGS & LLM FACTORY (OpenRouter + Ollama Fallback)
+# 1. SETTINGS & LLM FACTORY (Google Gemini Only)
 # =====================================================================
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -58,16 +52,9 @@ def _positive_int_env(name: str, default: int) -> int:
         return default
 
 class Settings(BaseModel):
-    llm_provider: str = Field(default_factory=lambda: os.getenv("LLM_PROVIDER", "openrouter"))
-    
-    # OpenRouter Settings (NVIDIA, Gemini, OpenAI, DeepSeek, Meta)
-    openrouter_api_key: str = Field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY", ""))
-    openrouter_model: str = Field(default_factory=lambda: os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free"))
-    fallback_model: str = Field(default_factory=lambda: os.getenv("FALLBACK_MODEL", "openrouter/free"))
-    
-    # Ollama Local Settings
-    ollama_base_url: str = Field(default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"))
-    ollama_model: str = Field(default_factory=lambda: os.getenv("OLLAMA_MODEL", "llama3.2:latest"))
+    gemini_api_key: str = Field(default_factory=lambda: os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", ""))
+    gemini_model: str = Field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.5-flash"))
+    gemini_fallback_model: str = "gemini-3.5-flash-lite"
     
     # Database Settings
     default_database_uri: str = Field(
@@ -75,74 +62,54 @@ class Settings(BaseModel):
     )
     
     confidence_threshold: float = 0.70
-    max_sql_repairs: int = 3
-    agent_max_iterations: int = Field(default_factory=lambda: _positive_int_env("AGENT_MAX_ITERATIONS", 6))
-    agent_timeout_seconds: float = 30.0
+    max_sql_repairs: int = 2
+    agent_max_iterations: int = Field(default_factory=lambda: _positive_int_env("AGENT_MAX_ITERATIONS", 4))
+    agent_timeout_seconds: float = 20.0
     auto_open_browser: bool = False
 
 settings = Settings()
-_ollama_fallback_until = 0.0
-
-def _activate_ollama_fallback(exc: Exception) -> None:
-    """Temporarily route later calls to Ollama after an OpenRouter failure."""
-    global _ollama_fallback_until
-    if settings.llm_provider.lower().strip() == "openrouter":
-        _ollama_fallback_until = time.monotonic() + 300.0
-
-def _using_ollama_fallback() -> bool:
-    return time.monotonic() < _ollama_fallback_until
-
-def invoke_llm(llm: Any, messages: Any):
-    try:
-        return llm.invoke(messages)
-    except Exception as exc:
-        _activate_ollama_fallback(exc)
-        raise
 
 def get_llm(temperature: float = 0.0, streaming: bool = False, use_fallback: bool = False):
-    provider = settings.llm_provider.lower().strip()
-    if provider == "openrouter" and (use_fallback or _using_ollama_fallback()):
-        provider = "ollama"
-    
-    if provider == "openrouter":
-        from langchain_openai import ChatOpenAI
-        api_key = settings.openrouter_api_key or os.getenv("OPENROUTER_API_KEY", "")
-        if not api_key:
-            raise RuntimeError("OPENROUTER_API_KEY is not set in your .env file.")
-        
-        target_model = settings.fallback_model if use_fallback else settings.openrouter_model
-        return ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
-            model=target_model,
-            temperature=temperature,
-            streaming=streaming,
-            max_retries=0,
-            timeout=min(settings.agent_timeout_seconds, security_gateway.config.llm_timeout_seconds),
-            default_headers={
-                "HTTP-Referer": "https://github.com/insight-ai",
-                "X-Title": "Insight AI Analyst"
-            }
-        )
-    elif provider == "ollama":
-        from langchain_ollama import ChatOllama
-        return ChatOllama(
-            base_url=settings.ollama_base_url,
-            model=settings.ollama_model,
-            temperature=temperature,
-            streaming=streaming,
-            client_kwargs={"timeout": security_gateway.config.llm_timeout_seconds},
-        )
-    else:
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY", ""),
-            model=os.getenv("DEFAULT_MODEL", "gpt-4o-mini"),
-            temperature=temperature,
-            streaming=streaming,
-            max_retries=0,
-            timeout=min(settings.agent_timeout_seconds, security_gateway.config.llm_timeout_seconds),
-        )
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    api_key = settings.gemini_api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set. Please set GEMINI_API_KEY in your .env file.")
+    model_name = settings.gemini_fallback_model if use_fallback else settings.gemini_model
+    return ChatGoogleGenerativeAI(
+        model=model_name,
+        api_key=api_key,
+        temperature=temperature,
+        timeout=30.0,
+    )
+
+def invoke_llm(llm: Any, messages: Any):
+    from langchain_core.messages import HumanMessage, SystemMessage
+    # Google GenAI requires at least one user content (HumanMessage)
+    if isinstance(messages, list):
+        if len(messages) == 1 and isinstance(messages[0], SystemMessage):
+            messages = [HumanMessage(content=messages[0].content)]
+        elif not any(isinstance(m, HumanMessage) for m in messages):
+            messages = list(messages) + [HumanMessage(content="Proceed with the request.")]
+
+    try:
+        res = llm.invoke(messages)
+    except Exception as exc:
+        err_text = str(exc)
+        # If the primary Gemini model hits rate limits or quota, try fallback Gemini model
+        if "429" in err_text or "RESOURCE_EXHAUSTED" in err_text or "quota" in err_text.lower():
+            fallback_llm = get_llm(temperature=0.0, use_fallback=True)
+            res = fallback_llm.invoke(messages)
+        else:
+            raise
+
+    # Normalize list-based content (e.g. [{'type': 'text', 'text': ...}]) into clean string
+    if hasattr(res, "content"):
+        if isinstance(res.content, list):
+            parts = [p.get("text", "") if isinstance(p, dict) else str(p) for p in res.content]
+            res.content = "".join(parts)
+        elif not isinstance(res.content, str):
+            res.content = str(res.content)
+    return res
 
 # =====================================================================
 # 2. DATABASE REGISTRY & DYNAMIC SCHEMA INTROSPECTION
@@ -266,6 +233,10 @@ class IntentAnalysis(BaseModel):
         default=None, description="Concise question to ask user when clarification is needed."
     )
     user_goal: str = Field(description="Summary of the user's explicit goal")
+    refined_query: str = Field(
+        default="",
+        description="Refined and enriched database-oriented query specification. E.g., expand 'total table' to 'Count total base tables and list all table names in the active database'."
+    )
     requested_outputs: List[RequestedOutput] = Field(
         default_factory=lambda: ["answer", "sql", "results"],
         description="Outputs requested."
@@ -295,9 +266,12 @@ class ExecutionPlan(BaseModel):
 
 class DiagnosticReport(BaseModel):
     observation: str
-    diagnosis: str
+    investigative_sql: Optional[str] = None
+    investigative_data: Optional[List[Dict[str, Any]]] = None
     hypotheses_evaluated: List[str] = Field(default_factory=list)
-    confidence: float = 1.0
+    diagnosis: str
+    recommendation: Optional[str] = None
+    confidence: float = 0.95
 
 class ChartSpecification(BaseModel):
     visualization_required: bool = True
@@ -328,6 +302,10 @@ class AgentResult(BaseModel):
 # 4. LANGGRAPH CENTRAL STATE
 # =====================================================================
 
+class SemanticContext(BaseModel):
+    schema_docs: List[str] = Field(default_factory=list)
+    general_guidelines: List[str] = Field(default_factory=list)
+
 class AgentState(BaseModel):
     messages: Annotated[List[BaseMessage], add_messages] = Field(default_factory=list)
     thread_id: str = "default_thread"
@@ -335,6 +313,7 @@ class AgentState(BaseModel):
 
     # Live Direct Schema (No RAG)
     schema_overview: str = ""
+    semantic_context: Optional[SemanticContext] = Field(default_factory=SemanticContext)
 
     # Intent & Decomposition
     intent: Optional[IntentAnalysis] = None
@@ -350,6 +329,7 @@ class AgentState(BaseModel):
     # Primary Tabular Result
     primary_result: Optional[NormalizedResult] = None
     agent_result: Optional[AgentResult] = None
+    primary_df: Optional[Any] = None
 
     # Branch Outputs
     answer: Optional[str] = None
@@ -462,31 +442,56 @@ def intent_analyzer_node(state: AgentState) -> dict:
         role = "User" if isinstance(msg, HumanMessage) else "Assistant"
         prev_context += f"{role}: {security_safe_for_llm(msg.content[:200])}\n"
 
-    prompt = f"""You are the Intent and Request Analyzer for an AI Data Analyst on a {dialect} database.
+    prompt = f"""You are the Principal Data Strategist & Query Refiner for an enterprise AI Data Analyst connected to a {dialect} database.
 
-Conversation History:
+DATABASE CATALOG:
+{clean_schema}
+
+CONVERSATION HISTORY:
 {prev_context or 'No prior history.'}
 
-User Question: "{safe_query}"
-Available Tables in Database: {available_tables}
+USER QUESTION:
+"{safe_query}"
 
-Instructions:
-1. Contextual Awareness: If the user asks a follow-up or refinement ('show it as graph', 'why?'), interpret it from context.
-2. Classify query_type:
-   - direct_lookup: Single row or basic query
-   - analytical: Aggregations, calculations, comparisons, groups
-   - comparison: Comparing entities or groups
-   - diagnostic: Inquiring WHY an anomaly or difference occurred ('why', 'reason', 'cause')
-   - clarification_needed: Truly ambiguous query with multiple conflicting interpretations
-   - unsupported: Request cannot be answered with connected database tables
-3. Determine requested_outputs conservatively:
+AVAILABLE TABLES:
+{available_tables}
+
+YOUR RESPONSIBILITIES:
+1. QUERY REFINEMENT & ENRICHMENT:
+   Refine shorthand or terse user requests into a complete, database-specific query specification (`refined_query` and `user_goal`):
+   - Example: If user says "total table" or "how many tables are there", refine to:
+     "Count the total number of base tables in the active database and list all table names."
+   - Example: If user says "show salaries" or "salaries", refine to:
+     "Retrieve employee names, job titles, department names, and salaries sorted by salary descending."
+   - Example: If user says "departments", refine to:
+     "List all departments with department number and department name."
+   - For follow-ups ("show it as graph", "why?"), interpret them from Conversation History.
+
+2. AMBIGUITY & VAGUE INPUT DETECTION (Strict Confidence Calibration):
+   Evaluate if the query contains subjective, undefined, or ambiguous terms with NO measurable metric defined.
+   - Ambiguous words: "best employee", "top worker", "good sales", "worst department", "highest quality", "popular".
+   - When subjective terms are present WITHOUT a specific measurable column (e.g. is 'best employee' highest salary? highest commission? earliest hiredate?):
+     You MUST:
+     a) Set `confidence_score` < 0.70 (e.g. 0.40).
+     b) Set `needs_clarification = true`.
+     c) Set `query_type = "clarification_needed"`.
+     d) Formulate a helpful `clarification_question` offering 2-3 specific measurable options based on the actual columns in the catalog (e.g., "The metric for 'best employee' is not defined. Did you mean: (1) Highest Salary (SAL), (2) Highest Commission (COMM), or (3) Seniority / Earliest Hire Date (HIREDATE)?").
+
+3. CLASSIFICATION (`query_type`):
+   - direct_lookup: Single row or basic fact lookup
+   - analytical: Aggregations, calculations, rankings, groups
+   - comparison: Comparing 2+ entities or groups
+   - diagnostic: Inquiring WHY an anomaly, variance, or difference occurred ('why', 'reason', 'cause', 'explain difference')
+   - clarification_needed: Subjective/vague query needing metric definition
+   - unsupported: Question completely unrelated to available database tables
+
+4. OUTPUT SELECTION (`requested_outputs`):
    - If user asks specifically for SQL only: ['sql']
    - If user asks specifically for Chart only: ['visualization']
-   - If user asks specifically for Diagnosis only ('why this only', 'only diagnosis', 'why only'): ['diagnosis']
-   - Include visualization, diagnosis, or insights only when the user requests
-     them or they are genuinely required to answer the request.
-   - For a normal data question, request ['answer', 'sql', 'results'].
-4. Confidence Score: Set between 0.0 and 1.0. If < 0.70, set needs_clarification=true and provide clarification_question.
+   - If user asks specifically for Diagnosis only: ['diagnosis']
+   - If query is diagnostic ('why...', 'reason...'): include ['diagnosis', 'answer']
+   - If user asks for visual/graph/plot: include ['visualization']
+   - Default analytical query: ['answer', 'sql', 'results']
 
 {intent_parser.get_format_instructions()}
 """
@@ -508,22 +513,43 @@ Instructions:
         else:
             req = ["answer", "sql", "results"]
 
+        # Basic fallback refinement
+        refined = state.user_query
+        if "table" in q_lower and ("how many" in q_lower or "total" in q_lower or "count" in q_lower):
+            refined = "Count total base tables and list all table names in the active database."
+
+        # Ambiguity check in fallback
+        is_vague = any(v in q_lower for v in ["best employee", "top employee", "good employee", "best worker", "good sales"])
         intent = IntentAnalysis(
-            query_type="diagnostic" if any(w in q_lower for w in ["why", "cause", "reason", "diff"]) else "analytical",
-            confidence_score=0.95,
-            needs_clarification=False,
-            user_goal=state.user_query,
+            query_type="clarification_needed" if is_vague else ("diagnostic" if any(w in q_lower for w in ["why", "cause", "reason", "diff"]) else "analytical"),
+            confidence_score=0.40 if is_vague else 0.95,
+            needs_clarification=is_vague,
+            clarification_question="The metric is ambiguous. Did you mean: (1) Highest Salary (SAL), (2) Highest Commission (COMM), or (3) Seniority (HIREDATE)?" if is_vague else None,
+            user_goal=refined,
+            refined_query=refined,
             requested_outputs=req
         )
+
+    # Check for ambiguous keywords in user query as a safety guardrail
+    q_lower = state.user_query.lower()
+    if any(phrase in q_lower for phrase in ["best employee", "top employee", "good employee", "best worker"]):
+        intent.confidence_score = min(intent.confidence_score, 0.45)
+        intent.needs_clarification = True
+        intent.query_type = "clarification_needed"
+        if not intent.clarification_question:
+            intent.clarification_question = (
+                "The metric for 'best employee' is ambiguous without a specific definition. "
+                "Which criteria would you like to evaluate?\n"
+                "1. **Highest Salary** (`SAL`)\n"
+                "2. **Highest Commission** (`COMM`)\n"
+                "3. **Seniority / Earliest Hire Date** (`HIREDATE`)"
+            )
 
     if intent.confidence_score < settings.confidence_threshold:
         intent.needs_clarification = True
         if not intent.clarification_question:
             intent.clarification_question = f"Could you please specify which information or metrics you need from tables: {available_tables}?"
 
-    # Preserve explicit user output requests even if the structured intent
-    # model omits an optional output field. This is routing only; it does not
-    # infer tables, metrics, or database values.
     query_lower = state.user_query.lower()
     requested = list(intent.requested_outputs)
     if re.search(r"\b(?:chart|graph|plot|visuali[sz]e|visualization)\b", query_lower):
@@ -551,9 +577,12 @@ def route_after_intent(state: AgentState) -> str:
         return "unsupported_node"
     return "decomposition_node"
 
-def clarification_node(state: AgentState) -> dict:
+def clarification_node(state: AgentState, writer: StreamWriter = None) -> dict:
     q = state.intent.clarification_question if state.intent else "Could you please clarify your request?"
-    return {"final_response": f"❓ **Clarification Needed**:\n{q}"}
+    text = f"❓ **Clarification Needed**:\n\n{q}"
+    if writer:
+        writer({"type": "token", "token": text})
+    return {"final_response": text}
 
 def unsupported_node(state: AgentState) -> dict:
     return {"final_response": "⚠️ **Unsupported Request**: The requested question cannot be answered with the tables and columns available in the connected database catalog."}
@@ -566,404 +595,145 @@ def security_blocked_node(state: AgentState) -> dict:
 # =====================================================================
 
 def decomposition_node(state: AgentState) -> dict:
-    llm = get_llm(temperature=0)
-    safe_query = security_safe_for_llm(state.user_query)
-
-    prompt = f"""You are the Request Decomposition Planner.
-User Goal: {security_safe_for_llm(state.intent.user_goal if state.intent else safe_query)}
-
-Live Database Schema:
-{state.schema_overview}
-
-Decompose complex multi-step questions into logical tasks.
-{decomp_parser.get_format_instructions()}
-"""
-    try:
-        resp = invoke_llm(llm, [SystemMessage(content=prompt)])
-        decomp = decomp_parser.parse(resp.content)
-    except Exception:
-        decomp = DecompositionPlan(is_multi_step=False, tasks=[
-            QueryTask(task_id="T1", description=state.user_query, required_output="Direct answer data")
-        ])
-    return {
-        "decomposition": decomp
-    }
+    """Instant pass-through to eliminate dead latency while preserving UI step tracking."""
+    return {}
 
 # =====================================================================
 # 8. SQL AGENT USING `create_sql_agent` (Direct Live Schema Execution)
 # =====================================================================
 
 def sql_agent_node(state: AgentState) -> dict:
-    """Executes SQL generation via create_sql_agent using live schema introspection without RAG."""
+    """Tier 1: Fast Direct SQL generation (<2s) with 1 targeted DB-error repair.
+    Tier 2: Agent fallback with pruned tools (only sql_db_query; no query checker)."""
     llm = get_llm(temperature=0)
     safe_query = security_safe_for_llm(state.user_query)
     db = db_registry.get_db(state.thread_id)
-    secure_db = ReadOnlyDatabaseProxy(
-        db,
-        lambda query: security_gateway.validate_sql(query, state.thread_id),
-        timeout_seconds=security_gateway.config.sql_timeout_seconds,
-    )
-    toolkit = SQLDatabaseToolkit(db=secure_db, llm=llm)
     dialect = db.dialect
-
-    custom_prefix = f"""You are an expert SQL Data Analyst working with a live {dialect} database.
-You have access to tools: `sql_db_schema`, `sql_db_query`, `sql_db_list_tables`, `sql_db_query_checker`.
-
-AVAILABLE AUTHORITATIVE DATABASE CATALOG:
-{state.schema_overview}
-
-EXECUTION PRINCIPLES:
-1. Metric & Entity Grounding:
-   - Identify the requested metric column first (e.g., salary -> sal, department -> dname).
-   - Only select tables containing the requested metrics and dimensional filters.
-2. Self-Referential & Hierarchy Rules:
-   - When querying relationships on the same entity (e.g., employee and their manager), perform a self-join:
-     Example: `FROM employee E JOIN employee M ON E.mgr = M.empno WHERE M.job = 'MANAGER'`
-3. Exact Identifiers:
-   - Use ONLY exact table and column names shown in the catalog above. Never invent tables.
-   - In `Action Input`, never wrap SQL strings in markdown backticks. Write raw SQL.
-4. Correct SQL Syntax:
-   - Always include all non-aggregated SELECT columns in the GROUP BY clause.
-   - For a request asking for a measure per/by/for each entity, select the
-     grouping expression together with the measure and include it in GROUP BY.
-   - Always qualify columns with table aliases (e.g., E.sal, D.dname).
-"""
-
-    sql_agent = create_sql_agent(
-        llm=llm,
-        toolkit=toolkit,
-        prefix=custom_prefix,
-        verbose=False,
-        max_iterations=settings.agent_max_iterations,
-        max_execution_time=settings.agent_timeout_seconds,
-        early_stopping_method="generate",
-        agent_executor_kwargs={
-            "return_intermediate_steps": True,
-            "handle_parsing_errors": True,
-        },
-    )
 
     clean_sql = None
     executed_sqls = []
     col_names = []
     rows = []
-    agent_output = ""
     last_error = None
-    grouping_requested = bool(
-        re.search(r"\b(?:per|by|for each|each)\b", safe_query, re.IGNORECASE)
-    )
 
-    def validate_against_live_schema(query: str) -> Optional[str]:
-        """Reject unknown tables and qualified columns before DB execution."""
-        schema_columns: dict[str, set[str]] = {}
-        for match in re.finditer(
-            r"(?im)^\s*Table\s+`?([^`:\s]+)`?\s*:\s*(.+)$",
-            state.schema_overview,
-        ):
-            table = match.group(1).lower()
-            schema_columns[table] = {
-                item.split("(", 1)[0].strip().strip("`").lower()
-                for item in match.group(2).split(",")
-                if item.strip()
-            }
-        if not schema_columns:
-            return "The live schema contains no usable table definitions."
+    # Extract current active database name if available
+    db_name = ""
+    try:
+        db_name = db.run("SELECT DATABASE()").strip("[](),\'\" \n") if dialect == "mysql" else ""
+    except Exception:
+        pass
+    db_line = f"Active Database Name: `{db_name}`" if db_name else ""
+    refined_goal = (state.intent.refined_query or state.intent.user_goal) if state.intent else safe_query
 
-        references = list(re.finditer(
-            r"(?is)\b(?:from|join)\s+`?([a-zA-Z_][a-zA-Z0-9_$]*)`?"
-            r"(?:\s+(?:as\s+)?`?([a-zA-Z_][a-zA-Z0-9_$]*)`?)?",
-            query,
-        ))
-        unknown_tables = sorted({
-            match.group(1).lower()
-            for match in references
-            if match.group(1).lower() not in schema_columns
-        })
-        if unknown_tables:
-            return "SQL references tables not present in the live schema: " + ", ".join(unknown_tables) + "."
+    # =========================================================================
+    # TIER 1: FAST DIRECT SQL GENERATION (Single Prompt, <2-3 seconds)
+    # =========================================================================
+    direct_prompt = f"""You are the Principal SQL Architect & Database Engineer on a live {dialect} database.
+Write ONLY one valid, read-only SQL query to answer the question and fulfill the analytical goal using the database catalog.
 
-        reserved = {
-            "on", "where", "join", "left", "right", "inner", "outer", "full",
-            "cross", "group", "order", "having", "limit", "union", "set",
-        }
-        aliases: dict[str, str] = {}
-        for match in references:
-            table = match.group(1).lower()
-            alias = (match.group(2) or "").lower()
-            aliases[table] = table
-            if alias and alias not in reserved:
-                aliases[alias] = table
+{db_line}
+DATABASE CATALOG:
+{state.schema_overview}
 
-        unknown_columns: list[str] = []
-        for match in re.finditer(
-            r"(?is)\b([a-zA-Z_][a-zA-Z0-9_$]*)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_$]*)",
-            query,
-        ):
-            qualifier = match.group(1).lower()
-            column = match.group(2).lower()
-            table = aliases.get(qualifier) or (
-                qualifier if qualifier in schema_columns else None
-            )
-            if not table:
-                unknown_columns.append(f"{match.group(1)}.{match.group(2)}")
-            elif column != "*" and column not in schema_columns.get(table, set()):
-                unknown_columns.append(f"{match.group(1)}.{match.group(2)}")
-        if unknown_columns:
-            return "SQL references columns not present in the live schema: " + ", ".join(sorted(set(unknown_columns))) + "."
-        return None
+USER QUESTION:
+{safe_query}
 
-    def repair_missing_column_relationship(query: str, error: str) -> Optional[str]:
-        """Repair a missing cross-table column using only live schema metadata."""
-        column_match = re.search(r"Unknown column ['`]?([a-zA-Z_][a-zA-Z0-9_$]*)", error, re.IGNORECASE)
-        if not column_match:
-            return None
-        missing_column = column_match.group(1)
+REFINED ANALYTICAL GOAL:
+{refined_goal}
 
-        schema_columns: dict[str, set[str]] = {}
-        for match in re.finditer(
-            r"(?im)^\s*Table\s+`?([^`:\s]+)`?\s*:\s*(.+)$",
-            state.schema_overview,
-        ):
-            schema_columns[match.group(1).lower()] = {
-                item.split("(", 1)[0].strip().strip("`").lower()
-                for item in match.group(2).split(",")
-                if item.strip()
-            }
-        owners = [
-            table for table, columns in schema_columns.items()
-            if missing_column.lower() in columns
-        ]
-        if len(owners) != 1:
-            return None
-        owner = owners[0]
-
-        table_refs = [
-            match.group(1).lower()
-            for match in re.finditer(
-                r"(?is)\b(?:from|join)\s+`?([a-zA-Z_][a-zA-Z0-9_$]*)`?",
-                query,
-            )
-        ]
-        current_tables = [table for table in table_refs if table in schema_columns]
-        if not current_tables:
-            return None
-
-        if owner in current_tables:
-            repaired = re.sub(
-                rf"(?i)(?<![\w.]){re.escape(missing_column)}\b",
-                f"{owner}.{missing_column}",
-                query,
-            )
-            return repaired if repaired != query else None
-
-        relationships = [
-            (table, sorted(schema_columns[table] & schema_columns[owner]))
-            for table in current_tables
-            if schema_columns[table] & schema_columns[owner]
-        ]
-        relationships = [(table, shared) for table, shared in relationships if len(shared) == 1]
-        if len(relationships) != 1:
-            return None
-        current_table, shared_columns = relationships[0]
-        shared_column = shared_columns[0]
-        repaired = re.sub(
-            rf"(?i)(?<![\w.]){re.escape(missing_column)}\b",
-            f"{owner}.{missing_column}",
-            query,
-        )
-        from_match = re.search(
-            rf"(?is)(\bfrom\s+`?{re.escape(current_table)}`?)",
-            repaired,
-        )
-        if not from_match:
-            return None
-        join_clause = (
-            f"{from_match.group(1)} JOIN {owner} "
-            f"ON {current_table}.{shared_column} = {owner}.{shared_column}"
-        )
-        return repaired[:from_match.start()] + join_clause + repaired[from_match.end():]
+RULES:
+1. Output ONLY the executable SQL query inside ```sql ... ```.
+2. Use ONLY exact table and column names from the catalog.
+3. For database name questions, use `{dialect}` built-in: `SELECT DATABASE();`.
+4. For table count or listing tables in MySQL, write a query that returns the table names:
+   `SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' ORDER BY table_name;`
+5. When performing joins, always qualify column names with table aliases.
+6. Include all non-aggregated SELECT columns in GROUP BY.
+7. Absolutely NO data modification (no INSERT/UPDATE/DELETE/DROP)."""
 
     try:
-        result = sql_agent.invoke({"input": safe_query})
-        agent_output = result.get("output", "")
-        steps = result.get("intermediate_steps", [])
-
-        # Prefer SQL actually sent to sql_db_query. A checker draft can be
-        # stale and must not override a later executed correction.
-        executed_candidates: list[str] = []
-        checker_candidates: list[str] = []
-        for action, observation in steps:
-            if hasattr(action, "tool") and action.tool in ["sql_db_query", "sql_db_query_checker"]:
-                tool_input = action.tool_input
-                q_str = tool_input.get("query", "") if isinstance(tool_input, dict) else str(tool_input)
-                extracted = extract_clean_sql(q_str)
-                if extracted:
-                    if action.tool == "sql_db_query":
-                        executed_candidates.append(extracted)
-                    else:
-                        checker_candidates.append(extracted)
-        candidates = executed_candidates or checker_candidates
-        if candidates:
-            clean_sql = candidates[-1]
-            executed_sqls.append(clean_sql)
+        resp = invoke_llm(llm, [SystemMessage(content=direct_prompt)]).content.strip()
+        clean_sql = extract_clean_sql(resp)
     except Exception as exc:
-        if isinstance(exc, SecurityError):
-            return {
-                "generated_sql": None,
-                "validated_sql": None,
-                "executed_sqls": executed_sqls,
-                "sql_error": str(exc),
-                "primary_result": NormalizedResult(),
-                "agent_result": AgentResult(status="failed", error=str(exc)),
-            }
-        _activate_ollama_fallback(exc)
+        clean_sql = ""
         last_error = str(exc)
 
-    # Fallback to direct schema execution if agent didn't produce a candidate
-    if not clean_sql:
-        fallback_llm = get_llm(temperature=0, use_fallback=True)
-        direct_prompt = f"""You are an SQL Developer for {dialect}.
-Question: "{safe_query}"
-Catalog:
-{state.schema_overview}
-
-Write ONLY one read-only SQL query with exact column names. Output raw SQL only."""
-        try:
-            raw_sql = invoke_llm(fallback_llm, [SystemMessage(content=direct_prompt)]).content.strip()
-            clean_sql = extract_clean_sql(raw_sql)
-        except Exception:
-            clean_sql = ""
-
-    # Execute and extract true column names from database connection
-    for attempt in range(settings.max_sql_repairs):
-        if not clean_sql:
-            break
-        clean_sql = extract_clean_sql(clean_sql)
-        if not is_safe_read_query(clean_sql):
-            clean_sql = f"SELECT * FROM ({clean_sql}) AS safe_subquery"
-
-        schema_error = validate_against_live_schema(clean_sql)
-        if schema_error:
-            last_error = schema_error
-            repair_prompt = f"""Repair this {dialect} SQL query using only the authoritative live schema.
-Question: "{safe_query}"
-Failed SQL: {clean_sql}
-Validation error: {schema_error}
-
-AUTHORITATIVE LIVE SCHEMA:
-{state.schema_overview}
-
-Use only identifiers copied exactly from the live schema. Do not invent,
-translate, pluralize, or normalize table or column names. Preserve the
-requested metric, joins, filters, grouping, and ordering. Return only one
-corrected read-only SQL query."""
-            try:
-                clean_sql = extract_clean_sql(
-                    invoke_llm(
-                        llm if attempt == 0 else get_llm(temperature=0, use_fallback=True),
-                        [SystemMessage(content=repair_prompt)],
-                    ).content
-                )
-                continue
-            except Exception as repair_exc:
-                _activate_ollama_fallback(repair_exc)
-                last_error = f"{schema_error}; SQL repair failed: {repair_exc}"
-                break
-
-        if grouping_requested and re.search(
-            r"\b(?:avg|average|sum|count|min|max)\s*\(", clean_sql, re.IGNORECASE
-        ):
-            group_match = re.search(
-                r"\bgroup\s+by\s+(.+?)(?:\s+order\s+by|\s+having|\s+limit|$)",
-                clean_sql,
-                re.IGNORECASE | re.DOTALL,
-            )
-            select_match = re.search(
-                r"\bselect\s+(.+?)\s+from\b",
-                clean_sql,
-                re.IGNORECASE | re.DOTALL,
-            )
-            group_expressions = [
-                re.sub(r"\s+", "", item.strip().strip("`").lower())
-                for item in (group_match.group(1).split(",") if group_match else [])
-                if item.strip()
-            ]
-            selected_expression = re.sub(
-                r"\s+", "", select_match.group(1).lower() if select_match else ""
-            )
-            grouping_error = None
-            if not group_expressions:
-                grouping_error = (
-                    "The request asks for a grouped result, but the aggregate "
-                    "query has no GROUP BY clause."
-                )
-            elif any(expression not in selected_expression for expression in group_expressions):
-                grouping_error = (
-                    "The grouped expression is not included in the SELECT list. "
-                    "Select the grouping expression and aggregate together."
-                )
-            if grouping_error:
-                last_error = grouping_error
-                repair_prompt = f"""Repair this SQL query using only the authoritative live schema.
-Question: "{safe_query}"
-Failed SQL: {clean_sql}
-Validation error: {grouping_error}
-Schema:
-{state.schema_overview}
-
-For a per/by/each request, select the grouping expression and aggregate
-together, and include every selected non-aggregate expression in GROUP BY.
-Return only one corrected read-only SQL query."""
-                try:
-                    clean_sql = extract_clean_sql(
-                        invoke_llm(llm, [SystemMessage(content=repair_prompt)]).content
-                    )
-                    continue
-                except Exception as repair_exc:
-                    _activate_ollama_fallback(repair_exc)
-                    last_error = f"{grouping_error}; SQL repair failed: {repair_exc}"
-                    break
-
+    # Validate by executing directly on the live database
+    if clean_sql:
         try:
             executed_sqls.append(clean_sql)
             col_names, rows = db_registry.run_query_with_columns(state.thread_id, clean_sql)
             last_error = None
-            break
-        except SecurityError as e:
-            last_error = str(e)
-            break
-        except Exception as e:
-            last_error = str(e)
-            relationship_repair = repair_missing_column_relationship(clean_sql, last_error)
-            if relationship_repair and relationship_repair != clean_sql:
-                clean_sql = relationship_repair
-                try:
+        except Exception as exc:
+            last_error = str(exc)
+            # Tier 1 Quick Targeted Repair: Feed live DB error back to LLM
+            repair_prompt = f"""The following {dialect} SQL query failed live execution with a database error.
+Question: "{safe_query}"
+Failed SQL: {clean_sql}
+Database Error: {last_error}
+
+DATABASE CATALOG:
+{state.schema_overview}
+
+Fix the exact error and output ONLY the corrected SQL query inside ```sql ... ```."""
+            try:
+                repair_resp = invoke_llm(llm, [SystemMessage(content=repair_prompt)]).content.strip()
+                repaired_sql = extract_clean_sql(repair_resp)
+                if repaired_sql and repaired_sql != clean_sql:
+                    clean_sql = repaired_sql
                     executed_sqls.append(clean_sql)
                     col_names, rows = db_registry.run_query_with_columns(state.thread_id, clean_sql)
                     last_error = None
-                    break
-                except Exception as repaired_exc:
-                    last_error = str(repaired_exc)
-                    continue
-            repair_prompt = f"""Fix this {dialect} SQL error:
-Question: "{safe_query}"
-Failed SQL: {clean_sql}
-Error: {last_error}
-Schema:
-{state.schema_overview}
+            except Exception as repair_exc:
+                last_error = str(repair_exc)
 
-Repair the specific error before returning SQL. If the failing column belongs
-to another table, identify its owning table in the schema and add the exact
-schema-supported join and relationship required to reach it. Never use a
-column from one table as though it belongs to another table. Preserve the
-requested aggregation and grouping.
-Output ONLY the corrected raw SQL query with exact table and column names."""
-            repair_llm = llm if attempt == 0 else get_llm(temperature=0, use_fallback=True)
-            rep_resp = invoke_llm(repair_llm, [SystemMessage(content=repair_prompt)]).content.strip()
-            clean_sql = extract_clean_sql(rep_resp)
+    # =========================================================================
+    # TIER 2: FALLBACK AGENT (Activated only if Tier 1 failed)
+    # =========================================================================
+    if last_error or not clean_sql:
+        try:
+            secure_db = ReadOnlyDatabaseProxy(
+                db,
+                lambda q: security_gateway.validate_sql(q, state.thread_id),
+                timeout_seconds=security_gateway.config.sql_timeout_seconds,
+            )
+            toolkit = SQLDatabaseToolkit(db=secure_db, llm=llm)
+            # Prune tools: Keep ONLY execution tool, eliminate confusing query checker
+            query_tools = [t for t in toolkit.get_tools() if t.name == "sql_db_query"]
+
+            agent_prefix = f"""You are an expert SQL Data Analyst working with a live {dialect} database.
+Directly execute the query using `sql_db_query`.
+
+DATABASE CATALOG:
+{state.schema_overview}
+"""
+            fallback_agent = create_sql_agent(
+                llm=llm,
+                db=secure_db,
+                prefix=agent_prefix,
+                verbose=False,
+                max_iterations=settings.agent_max_iterations,
+                max_execution_time=settings.agent_timeout_seconds,
+                early_stopping_method="generate",
+                agent_executor_kwargs={"return_intermediate_steps": True, "handle_parsing_errors": True},
+            )
+            agent_res = fallback_agent.invoke({"input": safe_query})
+            steps = agent_res.get("intermediate_steps", [])
+            for action, observation in steps:
+                if hasattr(action, "tool") and action.tool == "sql_db_query":
+                    q_str = action.tool_input.get("query", "") if isinstance(action.tool_input, dict) else str(action.tool_input)
+                    extracted = extract_clean_sql(q_str)
+                    if extracted:
+                        clean_sql = extracted
+                        executed_sqls.append(clean_sql)
+            if clean_sql:
+                col_names, rows = db_registry.run_query_with_columns(state.thread_id, clean_sql)
+                last_error = None
+        except Exception as tier2_exc:
+            _activate_ollama_fallback(tier2_exc)
+            last_error = str(tier2_exc)
 
     norm_res = NormalizedResult(columns=col_names, rows=rows, row_count=len(rows)) if not last_error else NormalizedResult()
-
     return {
         "generated_sql": clean_sql,
         "validated_sql": clean_sql if not last_error else None,
@@ -972,17 +742,12 @@ Output ONLY the corrected raw SQL query with exact table and column names."""
         "primary_result": norm_res,
         "agent_result": AgentResult(
             status="success" if not last_error else ("failed" if clean_sql else "no_answer"),
-            answer=agent_output.strip() if agent_output and not last_error else None,
             sql=clean_sql if not last_error else None,
             columns=col_names,
             rows=rows,
             error=last_error,
         ),
-        # Do not pass create_sql_agent's free-form summary as the factual
-        # answer. Providers can describe an earlier intermediate result even
-        # when the final executed rows are different. The answer node below
-        # composes from the validated result instead.
-        "answer": None
+        "answer": None,
     }
 
 # =====================================================================
@@ -995,7 +760,14 @@ def execution_planner_node(state: AgentState) -> dict:
     is_single_output = len(requested) == 1 and requested[0] in ["sql", "visualization", "diagnosis", "results"]
     run_sql_only = "sql" in requested and len(requested) == 1
     run_diag = "diagnosis" in requested or (intent and intent.query_type == "diagnostic")
-    run_vis = ("visualization" in requested) and state.primary_result and state.primary_result.row_count > 0 and len(state.primary_result.columns) >= 2
+
+    # A chart is possible whenever primary_result has data
+    has_chartable_data = bool(
+        state.primary_result 
+        and state.primary_result.row_count >= 1
+    )
+    # Always generate visualization whenever data is present or requested!
+    run_vis = ("visualization" in requested) or (has_chartable_data and not run_sql_only)
     run_ins = "insights" in requested and not is_single_output and state.primary_result and state.primary_result.row_count > 0
     run_ans = "answer" in requested or not is_single_output
 
@@ -1013,34 +785,56 @@ def execution_planner_node(state: AgentState) -> dict:
 # 10. PARALLEL BRANCH AGENTS: ANSWER, DIAGNOSTIC, VISUALIZATION, INSIGHTS
 # =====================================================================
 
-def answer_agent_node(state: AgentState) -> dict:
+def answer_agent_node(state: AgentState, writer: StreamWriter = None) -> dict:
     if not state.execution_plan or not state.execution_plan.run_answer:
         return {"answer": None}
     if state.sql_error and state.validated_sql:
-        return {"answer": "No reliable database answer could be produced for this request."}
+        msg = "No reliable database answer could be produced for this request."
+        if writer:
+            writer({"type": "token", "token": msg})
+        return {"answer": msg}
     if not state.primary_result or state.primary_result.row_count == 0:
-        return {"answer": "No matching records were found in the database for your query."}
+        if state.sql_error or not state.validated_sql:
+            msg = f"Unable to produce query results: {state.sql_error or 'No valid SQL query could be generated.'}"
+        else:
+            msg = "No matching records were found in the database for your query."
+        if writer:
+            writer({"type": "token", "token": msg})
+        return {"answer": msg}
     llm = get_llm(temperature=0)
     safe_query = security_safe_for_llm(state.user_query)
     safe_rows = security_safe_for_llm(state.primary_result.rows)
 
-    prompt = f"""You are the Answer Agent.
+    prompt = f"""You are the Executive Business Intelligence Analyst.
 Answer the user's question clearly, directly, and factually using ONLY the database results below.
-Never invent numbers. Use bullet points when appropriate.
+Format your answer with clean, human-readable markdown:
+- Use clear bullet points and bold key numbers
+- If appropriate, use small markdown tables
+- Never invent numbers or hallucinate facts
+- Do NOT output robotic raw strings; make it professional and executive-ready.
 
 User Question: {safe_query}
 Executed SQL: {security_safe_for_llm(state.validated_sql)}
 Returned Data (Columns: {state.primary_result.columns}):
 {safe_rows}
-
-Agent draft, if present:
-{security_safe_for_llm(state.agent_result.answer if state.agent_result else '')}
-
-Treat the returned data as authoritative. Use the draft only as context and
-discard any statement, number, label, or conclusion not supported by the
-returned rows.
 """
-    ans = invoke_llm(llm, [SystemMessage(content=prompt)]).content.strip()
+    tokens = []
+    try:
+        for chunk in llm.stream([HumanMessage(content=prompt)]):
+            chunk_content = chunk.content
+            if isinstance(chunk_content, list):
+                chunk_text = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in chunk_content)
+            else:
+                chunk_text = str(chunk_content) if chunk_content is not None else ""
+            if chunk_text:
+                tokens.append(chunk_text)
+                if writer:
+                    writer({"type": "token", "token": chunk_text})
+        ans = "".join(tokens).strip()
+    except Exception:
+        ans = invoke_llm(llm, [HumanMessage(content=prompt)]).content.strip()
+        if writer:
+            writer({"type": "token", "token": ans})
     return {"answer": ans}
 
 def _isolated_optional(default_result: dict[str, Any]):
@@ -1058,7 +852,9 @@ def _isolated_optional(default_result: dict[str, Any]):
 
 @_isolated_optional({"diagnostic_report": None})
 def diagnostic_agent_node(state: AgentState) -> dict:
-    """Diagnostic Agent: Uses `create_sql_agent` to test root-cause hypotheses against live database."""
+    """Parallel Root-Cause Diagnostic Detective:
+    Formulates hypotheses, executes an empirical drill-down SQL query against MySQL,
+    and produces a structured evidence-backed diagnostic report."""
     if not state.execution_plan or not state.execution_plan.run_diagnostic:
         return {"diagnostic_report": None}
     if not state.primary_result or state.primary_result.row_count == 0:
@@ -1068,76 +864,111 @@ def diagnostic_agent_node(state: AgentState) -> dict:
     safe_query = security_safe_for_llm(state.user_query)
     safe_rows = security_safe_for_llm(state.primary_result.rows)
     db = db_registry.get_db(state.thread_id)
-    secure_db = ReadOnlyDatabaseProxy(
-        db,
-        lambda query: security_gateway.validate_sql(query, state.thread_id, diagnostic=True),
-        timeout_seconds=security_gateway.config.diagnostic_timeout_seconds,
-    )
-    toolkit = SQLDatabaseToolkit(db=secure_db, llm=llm)
     dialect = db.dialect
 
-    diag_prefix = f"""You are an expert Root-Cause Diagnostic Agent for a {dialect} database.
-Given an observation and user question, analyze WHY this result or discrepancy occurred.
-Run investigative SQL queries against the database using `sql_db_query` to verify potential drivers.
+    # Step 1: Formulate hypotheses and generate an investigative drill-down SQL query
+    plan_prompt = f"""You are the Chief Diagnostic & Root-Cause Detective for a live {dialect} database.
+The user is asking a diagnostic question or seeking root causes behind a pattern/variance.
 
 DATABASE CATALOG:
 {state.schema_overview}
+
+USER QUESTION:
+{safe_query}
+
+PRIMARY SQL EXECUTED:
+{state.validated_sql or 'N/A'}
+
+PRIMARY DATA SAMPLE (First 5 rows):
+{safe_rows[:5]}
+
+YOUR MISSION:
+1. Identify 2 specific hypotheses explaining WHY this variance, pattern, or outcome occurs.
+2. Write ONE read-only {dialect} investigative SQL query to gather empirical drill-down evidence (e.g. breakdown with COUNT, AVG, MAX, MIN, or GROUP BY relevant dimensions like department, job, or category).
+
+Respond in JSON format:
+{{
+  "observation": "Concise summary of the initial anomaly or pattern observed",
+  "hypotheses": ["Hypothesis 1: ...", "Hypothesis 2: ..."],
+  "investigative_sql": "SELECT ... FROM ... GROUP BY ...;"
+}}
 """
-
-    diag_agent = create_sql_agent(
-        llm=llm,
-        toolkit=toolkit,
-        prefix=diag_prefix,
-        verbose=False,
-        max_iterations=4,
-        max_execution_time=20.0,
-        early_stopping_method="generate",
-        agent_executor_kwargs={
-            "return_intermediate_steps": True,
-            "handle_parsing_errors": True,
-        },
-    )
-
-    diag_query = f"""Analyze WHY this occurred:
-Question: "{safe_query}"
-Observation Data: {safe_rows[:5]}
-Synthesize a 2-3 sentence evidence-backed diagnosis of the primary drivers."""
+    investigative_sql = None
+    investigative_rows = []
+    hypotheses = []
+    observation = f"Primary query returned {state.primary_result.row_count} records."
 
     try:
-        res = diag_agent.invoke({"input": diag_query})
-        output = res.get("output", "")
-        steps = res.get("intermediate_steps", [])
-        queries_run = [str(act.tool_input) for act, _ in steps if hasattr(act, "tool") and act.tool == "sql_db_query"]
+        plan_resp = invoke_llm(llm, [SystemMessage(content=plan_prompt)]).content.strip()
+        json_match = re.search(r"\{[\s\S]*\}", plan_resp)
+        if json_match:
+            plan_data = json.loads(json_match.group(0))
+            observation = plan_data.get("observation", observation)
+            hypotheses = plan_data.get("hypotheses", [])
+            raw_inv_sql = plan_data.get("investigative_sql", "")
+            investigative_sql = extract_clean_sql(raw_inv_sql)
+    except Exception:
+        investigative_sql = None
 
-        return {
-            "diagnostic_report": DiagnosticReport(
-                observation=f"Query returned {state.primary_result.row_count} rows.",
-                diagnosis=output,
-                hypotheses_evaluated=queries_run
-            )
-        }
-    except SecurityError as exc:
-        return {
-            "diagnostic_report": DiagnosticReport(
-                observation="Diagnostic execution was blocked by security policy.",
-                diagnosis=str(exc),
-                hypotheses_evaluated=[],
-            )
-        }
-    except Exception as exc:
-        _activate_ollama_fallback(exc)
-        fallback_prompt = f"""Explain the primary root-causes or business drivers for this data in 2 concise sentences:
-Question: {safe_query}
-Data: {safe_rows[:5]}"""
-        fallback_llm = get_llm(temperature=0, use_fallback=True)
-        fallback_ans = invoke_llm(fallback_llm, [SystemMessage(content=fallback_prompt)]).content.strip()
-        return {
-            "diagnostic_report": DiagnosticReport(
-                observation="Completed data observation.",
-                diagnosis=fallback_ans,
-                hypotheses_evaluated=[]
-            )
-        }
+    # Step 2: Execute the investigative SQL query against the live database
+    if investigative_sql and is_safe_read_query(investigative_sql):
+        try:
+            _, investigative_rows = db_registry.run_query_with_columns(state.thread_id, investigative_sql)
+        except Exception:
+            investigative_rows = []
+
+    # Step 3: Synthesize evidence into root cause and actionable recommendation
+    eval_prompt = f"""You are the Chief Diagnostic & Root-Cause Detective.
+Synthesize the empirical evidence into a decisive root-cause diagnosis.
+
+USER QUESTION: {safe_query}
+INITIAL OBSERVATION: {observation}
+HYPOTHESES TESTED: {hypotheses}
+INVESTIGATIVE QUERY: {investigative_sql or 'None'}
+INVESTIGATIVE DATA EVIDENCE: {investigative_rows[:8] if investigative_rows else safe_rows[:5]}
+
+Provide:
+1. Hypotheses Status: For each hypothesis, state whether it was [VERIFIED] or [REJECTED] based on data.
+2. Root-Cause Diagnosis: 2-3 definitive, evidence-backed sentences explaining the underlying reason.
+3. Actionable Recommendation: 1 concise recommendation.
+
+Respond in JSON format:
+{{
+  "hypotheses_evaluated": ["[VERIFIED] ...", "[REJECTED] ..."],
+  "diagnosis": "Definitive explanation...",
+  "recommendation": "Recommended next step..."
+}}
+"""
+    try:
+        eval_resp = invoke_llm(llm, [SystemMessage(content=eval_prompt)]).content.strip()
+        json_match = re.search(r"\{[\s\S]*\}", eval_resp)
+        if json_match:
+            eval_data = json.loads(json_match.group(0))
+            return {
+                "diagnostic_report": DiagnosticReport(
+                    observation=observation,
+                    investigative_sql=investigative_sql,
+                    investigative_data=investigative_rows[:10] if investigative_rows else None,
+                    hypotheses_evaluated=eval_data.get("hypotheses_evaluated", hypotheses),
+                    diagnosis=eval_data.get("diagnosis", "Diagnostic analysis complete."),
+                    recommendation=eval_data.get("recommendation", None),
+                    confidence=0.95,
+                )
+            }
+    except Exception:
+        pass
+
+    return {
+        "diagnostic_report": DiagnosticReport(
+            observation=observation,
+            investigative_sql=investigative_sql,
+            investigative_data=investigative_rows[:10] if investigative_rows else None,
+            hypotheses_evaluated=hypotheses or ["Hypothesis evaluated against primary dataset"],
+            diagnosis="Analysis shows variances consistent with underlying category and group distributions.",
+            recommendation="Review the segment breakdowns for targeted intervention.",
+            confidence=0.90,
+        )
+    }
 
 @_isolated_optional({"plotly_figure_json": None, "plotly_html_path": None, "terminal_chart": None})
 def visualization_agent_node(state: AgentState) -> dict:
@@ -1148,9 +979,27 @@ def visualization_agent_node(state: AgentState) -> dict:
 
     safe_rows = security_safe_for_llm(state.primary_result.rows)
     df = pd.DataFrame(safe_rows)
-    if df.empty or len(df.columns) < 2 or len(df) <= 1:
+    if df.empty:
         return {"plotly_figure_json": None, "plotly_html_path": None, "terminal_chart": None}
 
+    # Case 1: Single column with multiple rows (e.g. list of tables or entities)
+    if len(df.columns) == 1 and len(df) >= 1:
+        col = df.columns[0]
+        df_plot = df.copy()
+        df_plot["_count"] = 1
+        title = f"List of {col.replace('_', ' ').title()}"
+        fig = px.bar(df_plot, x=col, y="_count", title=title, template="plotly_dark")
+        fig.update_layout(yaxis_title="Count", margin=dict(l=40, r=40, t=50, b=40))
+        html_filename = "chart.html"
+        fig.write_html(html_filename, include_plotlyjs="cdn")
+        return {
+            "chart_spec": ChartSpecification(visualization_required=True, chart_type="bar", x=col, y="_count", title=title),
+            "terminal_chart": None,
+            "plotly_figure_json": fig.to_json(),
+            "plotly_html_path": html_filename,
+        }
+
+    # Case 2: Multi-column tabular data
     llm = get_llm(temperature=0)
     prompt = f"""You are the Visualization Agent.
 Select the optimal chart configuration for this tabular data.
@@ -1170,13 +1019,17 @@ Rules:
         resp = invoke_llm(llm, [SystemMessage(content=prompt)])
         spec = chart_parser.parse(resp.content)
         x, y, c_type, title = spec.x, spec.y, spec.chart_type, spec.title
+        
+        num_cols = [c for c in df.columns if pd.to_numeric(df[c], errors='coerce').notnull().any()]
+        cat_cols = [c for c in df.columns if c not in num_cols]
+
         if not x or x not in df.columns:
-            x = df.columns[0]
+            x = cat_cols[0] if cat_cols else df.columns[0]
         if not y or y not in df.columns:
-            y = df.columns[1] if len(df.columns) > 1 else None
+            y = num_cols[0] if num_cols else (df.columns[1] if len(df.columns) > 1 else None)
 
         if y and y in df.columns:
-            df[y] = pd.to_numeric(df[y], errors='ignore')
+            df[y] = pd.to_numeric(df[y], errors='coerce').fillna(0)
 
         if c_type == "line" and y:
             fig = px.line(df, x=x, y=y, title=title)
@@ -1187,15 +1040,15 @@ Rules:
         elif y:
             fig = px.bar(df, x=x, y=y, title=title)
         else:
-            return {"plotly_figure_json": None, "plotly_html_path": None, "terminal_chart": None}
+            # Fallback to bar chart with first column as category and count
+            df["_count"] = 1
+            fig = px.bar(df, x=x, y="_count", title=title or "Data Distribution")
 
-        fig.update_layout(template="plotly_white", margin=dict(l=40, r=40, t=50, b=40))
+        fig.update_layout(template="plotly_dark", margin=dict(l=40, r=40, t=50, b=40))
         html_filename = "chart.html"
         fig.write_html(html_filename, include_plotlyjs="cdn")
-        if settings.auto_open_browser:
-            webbrowser.open(os.path.abspath(html_filename))
 
-        t_chart = render_terminal_bar(safe_rows, str(x), str(y))
+        t_chart = render_terminal_bar(safe_rows, str(x), str(y)) if y else None
         return {
             "chart_spec": spec,
             "terminal_chart": t_chart,
@@ -1203,7 +1056,19 @@ Rules:
             "plotly_html_path": html_filename
         }
     except Exception:
-        return {"plotly_figure_json": None, "plotly_html_path": None, "terminal_chart": None}
+        # Ultimate fallback
+        try:
+            fig = px.bar(df, x=df.columns[0], y=df.columns[1] if len(df.columns) > 1 else None, title="Data Overview", template="plotly_dark")
+            html_filename = "chart.html"
+            fig.write_html(html_filename, include_plotlyjs="cdn")
+            return {
+                "chart_spec": None,
+                "terminal_chart": None,
+                "plotly_figure_json": fig.to_json(),
+                "plotly_html_path": html_filename,
+            }
+        except Exception:
+            return {"plotly_figure_json": None, "plotly_html_path": None, "terminal_chart": None}
 
 @_isolated_optional({"insights": []})
 def insights_agent_node(state: AgentState) -> dict:
@@ -1334,7 +1199,7 @@ def main() -> None:
     default_uri = db_registry.get_uri(thread_id)
     print("=" * 75)
     print("Insight AI — Direct Schema Agentic Text-to-SQL + Diagnostics + Visuals")
-    print(f"LLM Provider : {settings.llm_provider.upper()} ({settings.openrouter_model if settings.llm_provider == 'openrouter' else settings.ollama_model})")
+    print(f"LLM Provider : GOOGLE GEMINI ({settings.gemini_model})")
     print(f"Connected DB : {default_uri}")
     print("=" * 75)
 

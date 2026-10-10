@@ -14,7 +14,12 @@ class MemoryManager:
     def __init__(self, directory: str | Path = "memory"):
         directory = Path(directory)
         memory_url = os.getenv("MEMORY_URL") or os.getenv("MEMORY__URL")
-        self.postgres = PostgresMemoryStore(memory_url) if memory_url and memory_url.startswith("postgres") else None
+        self.postgres = None
+        if memory_url and memory_url.startswith("postgres"):
+            try:
+                self.postgres = PostgresMemoryStore(memory_url)
+            except Exception:
+                self.postgres = None
         self.working = WorkingMemory(directory / "working_memory.sqlite3", database_url=memory_url if self.postgres else None)
         self.conversations = None if self.postgres else ConversationMemory(directory / "conversations.sqlite3")
         self.long_term = None if self.postgres else LongTermMemory(directory / "long_term.sqlite3")

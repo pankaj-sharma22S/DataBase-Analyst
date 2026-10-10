@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
+    "marked": "^18.1.0",
     "plotly.js-dist-min": "latest",
     "react": "latest",
     "react-dom": "latest",

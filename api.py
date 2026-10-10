@@ -16,11 +16,12 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from main3 import db_registry, memory_manager, build_workflow
+from security.redis_service import redis_service
 
 logger = logging.getLogger(__name__)
 
 
-app = FastAPI(title="Insight AI API", version="1.0.0")
+app = FastAPI(title="QueryMind AI API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -197,7 +198,26 @@ def _memory_messages(thread_id: str, query: str) -> list[Any]:
 
 
 def _input(request: AnalyzeRequest) -> dict[str, Any]:
-    return {"thread_id": request.thread_id, "user_query": request.query, "messages": _memory_messages(request.thread_id, request.query)}
+    return {
+        "thread_id": request.thread_id,
+        "user_query": request.query,
+        "messages": _memory_messages(request.thread_id, request.query),
+        "answer": None,
+        "validated_sql": None,
+        "generated_sql": None,
+        "sql_error": None,
+        "primary_result": None,
+        "agent_result": None,
+        "final_response": None,
+        "insights": [],
+        "diagnostic_report": None,
+        "chart_spec": None,
+        "plotly_figure_json": None,
+        "plotly_html_path": None,
+        "terminal_chart": None,
+        "security_blocked": False,
+        "security_message": None,
+    }
 
 
 def _safe_error_message(exc: Exception) -> str:
@@ -237,10 +257,13 @@ def list_threads() -> list[dict[str, Any]]:
 def connect_database(request: DatabaseConnectRequest) -> dict[str, Any]:
     try:
         db_registry.register_database(request.thread_id, request.database_uri)
+        # Test connection immediately
+        overview = db_registry.get_clean_schema_overview(request.thread_id)
         threads.setdefault(request.thread_id, {"thread_id": request.thread_id, "name": "Database Analysis"})
-        return {"thread_id": request.thread_id, "connected": True}
+        return {"thread_id": request.thread_id, "connected": True, "schema_overview": overview}
     except Exception as exc:
-        raise HTTPException(status_code=400, detail="Connection failed") from exc
+        logger.warning("Database connection failed for %s: %s", request.thread_id, exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/schema/{thread_id}")
@@ -306,11 +329,22 @@ async def _stream_analysis(request: AnalyzeRequest) -> AsyncIterator[str]:
 
     def run_workflow() -> None:
         try:
-            for event in workflow.stream(_input(request), config=config, stream_mode="debug"):
-                loop.call_soon_threadsafe(queue.put_nowait, ("event", event))
+            for mode, payload in workflow.stream(_input(request), config=config, stream_mode=["custom", "debug"]):
+                loop.call_soon_threadsafe(queue.put_nowait, (mode, payload))
             loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
         except Exception as exc:
             loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+
+    # 1. Semantic Cache check via Redis / Fallback
+    cached_result = redis_service.get_cached_answer(request.thread_id, request.query)
+    if cached_result:
+        yield f"data: {json.dumps({'type': 'connected', 'thread_id': request.thread_id})}\n\n"
+        ans_text = cached_result.get("answer") or cached_result.get("final_response") or ""
+        if ans_text:
+            yield f"data: {json.dumps({'type': 'token', 'token': ans_text})}\n\n"
+        yield f"data: {json.dumps({'type': 'result', 'data': cached_result}, default=str)}\n\n"
+        yield "data: {\"type\": \"done\"}\n\n"
+        return
 
     try:
         yield f"data: {json.dumps({'type': 'connected', 'thread_id': request.thread_id})}\n\n"
@@ -326,6 +360,9 @@ async def _stream_analysis(request: AnalyzeRequest) -> AsyncIterator[str]:
                 return
             if event_type == "done":
                 break
+            if event_type == "custom":
+                yield f"data: {json.dumps(event, default=str)}\n\n"
+                continue
             name = event.get("payload", {}).get("name", "")
             label = NODE_LABELS.get(name)
             if not label:
@@ -339,7 +376,8 @@ async def _stream_analysis(request: AnalyzeRequest) -> AsyncIterator[str]:
                 payload = {"type": "workflow", "step": name, "label": label, "status": "completed"}
                 output = event.get("payload", {}).get("result")
                 if output:
-                    payload["data"] = _state_payload(output)
+                    partial_data = _state_payload(output)
+                    payload["data"] = {k: v for k, v in partial_data.items() if v is not None}
             else:
                 continue
             yield f"data: {json.dumps(payload, default=str)}\n\n"
@@ -348,6 +386,8 @@ async def _stream_analysis(request: AnalyzeRequest) -> AsyncIterator[str]:
         result = _state_payload(workflow.get_state(config).values)
         if not result.get("security_blocked"):
             memory_manager.remember(request.thread_id, request.query, result.get("final_response") or "")
+            if result.get("answer") or result.get("primary_result"):
+                redis_service.set_cached_answer(request.thread_id, request.query, result, ttl_seconds=3600)
         yield f"data: {json.dumps({'type': 'result', 'data': result}, default=str)}\n\n"
         yield "data: {\"type\": \"done\"}\n\n"
     except Exception as exc:
